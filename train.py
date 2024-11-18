@@ -1,6 +1,16 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+"""
+@Author  :   Peike Li
+@Contact :   peike.li@yahoo.com
+@File    :   train.py
+@Time    :   8/4/19 3:36 PM
+@Desc    :
+@License :   This source code is licensed under the license found in the
+             LICENSE file in the root directory of this source tree.
+"""
+
 import os
 import json
 import timeit
@@ -18,11 +28,15 @@ from datasets.datasets import LIPDataSet
 from datasets.target_generation import generate_edge_tensor
 from utils.transforms import BGR2RGB_transform
 from utils.criterion import CriterionAll
+from utils.encoding import DataParallelModel, DataParallelCriterion
 from utils.warmup_scheduler import SGDRScheduler
 
 
 def get_arguments():
-    """Parse all the arguments provided from the CLI."""
+    """Parse all the arguments provided from the CLI.
+    Returns:
+      A list of parsed arguments.
+    """
     parser = argparse.ArgumentParser(description="Self Correction for Human Parsing")
 
     # Network Structure
@@ -39,7 +53,7 @@ def get_arguments():
     parser.add_argument("--learning-rate", type=float, default=7e-3)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--gpu", type=str, default='0')  # Default to single GPU
+    parser.add_argument("--gpu", type=str, default='0,1,2')
     parser.add_argument("--start-epoch", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--eval-epochs", type=int, default=10)
@@ -67,8 +81,9 @@ def main():
     with open(os.path.join(args.log_dir, 'args.json'), 'w') as opt_file:
         json.dump(vars(args), opt_file)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    gpus = [int(i) for i in args.gpu.split(',')]
+    if not args.gpu == 'None':
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     input_size = list(map(int, args.input_size.split(',')))
 
@@ -77,53 +92,62 @@ def main():
 
     # Model Initialization
     AugmentCE2P = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain)
-    model = AugmentCE2P.to(device)
+    model = DataParallelModel(AugmentCE2P)
+    model.cuda()
 
     IMAGE_MEAN = AugmentCE2P.mean
     IMAGE_STD = AugmentCE2P.std
     INPUT_SPACE = AugmentCE2P.input_space
-    print(f"image mean: {IMAGE_MEAN}, image std: {IMAGE_STD}, input space: {INPUT_SPACE}")
+    print('image mean: {}'.format(IMAGE_MEAN))
+    print('image std: {}'.format(IMAGE_STD))
+    print('input space:{}'.format(INPUT_SPACE))
 
     restore_from = args.model_restore
     if os.path.exists(restore_from):
-        print(f"Resume training from {restore_from}")
-        checkpoint = torch.load(restore_from, map_location=device)
+        print('Resume training from {}'.format(restore_from))
+        checkpoint = torch.load(restore_from)
         model.load_state_dict(checkpoint['state_dict'])
         start_epoch = checkpoint['epoch']
 
     SCHP_AugmentCE2P = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain)
-    schp_model = SCHP_AugmentCE2P.to(device)
+    schp_model = DataParallelModel(SCHP_AugmentCE2P)
+    schp_model.cuda()
 
     if os.path.exists(args.schp_restore):
-        print(f"Resuming schp checkpoint from {args.schp_restore}")
-        schp_checkpoint = torch.load(args.schp_restore, map_location=device)
+        print('Resuming schp checkpoint from {}'.format(args.schp_restore))
+        schp_checkpoint = torch.load(args.schp_restore)
         schp_model_state_dict = schp_checkpoint['state_dict']
         cycle_n = schp_checkpoint['cycle_n']
         schp_model.load_state_dict(schp_model_state_dict)
 
     # Loss Function
     criterion = CriterionAll(lambda_1=args.lambda_s, lambda_2=args.lambda_e, lambda_3=args.lambda_c,
-                             num_classes=args.num_classes).to(device)
+                             num_classes=args.num_classes)
+    criterion = DataParallelCriterion(criterion)
+    criterion.cuda()
 
     # Data Loader
     if INPUT_SPACE == 'BGR':
         print('BGR Transformation')
         transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
+            transforms.Normalize(mean=IMAGE_MEAN,
+                                 std=IMAGE_STD),
         ])
+
     elif INPUT_SPACE == 'RGB':
         print('RGB Transformation')
         transform = transforms.Compose([
             transforms.ToTensor(),
             BGR2RGB_transform(),
-            transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
+            transforms.Normalize(mean=IMAGE_MEAN,
+                                 std=IMAGE_STD),
         ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
-                                   num_workers=8, shuffle=True, pin_memory=True, drop_last=True)
-    print(f'Total training samples: {len(train_dataset)}')
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size * len(gpus),
+                                   num_workers=16, shuffle=True, pin_memory=True, drop_last=True)
+    print('Total training samples: {}'.format(len(train_dataset)))
 
     # Optimizer Initialization
     optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum,
@@ -145,12 +169,12 @@ def main():
             i_iter += len(train_loader) * epoch
 
             images, labels, _ = batch
-            images = images.to(device, non_blocking=True).float()
-            labels = labels.to(device, non_blocking=True)
+            images = images.cuda(non_blocking=True).type(torch.cuda.FloatTensor)
+            labels = labels.cuda(non_blocking=True)
 
             edges = generate_edge_tensor(labels)
-            labels = labels.long()
-            edges = edges.long()
+            labels = labels.type(torch.cuda.LongTensor)
+            edges = edges.type(torch.cuda.LongTensor)
 
             preds = model(images)
 
@@ -158,8 +182,11 @@ def main():
             if cycle_n >= 1:
                 with torch.no_grad():
                     soft_preds = schp_model(images)
-                    soft_parsing = [soft_pred[0][-1] for soft_pred in soft_preds]
-                    soft_edge = [soft_pred[1][-1] for soft_pred in soft_preds]
+                    soft_parsing = []
+                    soft_edge = []
+                    for soft_pred in soft_preds:
+                        soft_parsing.append(soft_pred[0][-1])
+                        soft_edge.append(soft_pred[1][-1])
                     soft_preds = torch.cat(soft_parsing, dim=0)
                     soft_edges = torch.cat(soft_edge, dim=0)
             else:
@@ -173,31 +200,32 @@ def main():
             optimizer.step()
 
             if i_iter % 100 == 0:
-                print(f'iter = {i_iter} of {total_iters} completed, lr = {lr}, loss = {loss.item()}')
-
-        if (epoch + 1) % args.eval_epochs == 0:
+                print('iter = {} of {} completed, lr = {}, loss = {}'.format(i_iter, total_iters, lr,
+                                                                             loss.data.cpu().numpy()))
+        if (epoch + 1) % (args.eval_epochs) == 0:
             schp.save_schp_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
-            }, False, args.log_dir, filename=f'checkpoint_{epoch + 1}.pth.tar')
+            }, False, args.log_dir, filename='checkpoint_{}.pth.tar'.format(epoch + 1))
 
         # Self Correction Cycle with Model Aggregation
         if (epoch + 1) >= args.schp_start and (epoch + 1 - args.schp_start) % args.cycle_epochs == 0:
-            print(f'Self-correction cycle number {cycle_n}')
+            print('Self-correction cycle number {}'.format(cycle_n))
             schp.moving_average(schp_model, model, 1.0 / (cycle_n + 1))
             cycle_n += 1
             schp.bn_re_estimate(train_loader, schp_model)
             schp.save_schp_checkpoint({
                 'state_dict': schp_model.state_dict(),
                 'cycle_n': cycle_n,
-            }, False, args.log_dir, filename=f'schp_{cycle_n}_checkpoint.pth.tar')
+            }, False, args.log_dir, filename='schp_{}_checkpoint.pth.tar'.format(cycle_n))
 
         torch.cuda.empty_cache()
         end = timeit.default_timer()
-        print(f'epoch = {epoch} of {args.epochs} completed using {(end - start) / (epoch - start_epoch + 1)} s')
+        print('epoch = {} of {} completed using {} s'.format(epoch, args.epochs,
+                                                             (end - start) / (epoch - start_epoch + 1)))
+
     end = timeit.default_timer()
-    print(f'Training completed in {(end - start) / 60.0} min')
-    return
+    print('Training Finished in {} seconds'.format(end - start))
 
 
 if __name__ == '__main__':
