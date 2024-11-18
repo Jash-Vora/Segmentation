@@ -169,6 +169,7 @@ def main():
             i_iter += len(train_loader) * epoch
 
             images, labels, _ = batch
+            images = images.cuda(non_blocking=True).type(torch.cuda.FloatTensor)
             labels = labels.cuda(non_blocking=True)
 
             edges = generate_edge_tensor(labels)
