@@ -106,13 +106,13 @@ def main():
     # Data Loader
     transform = transforms.Compose([
         transforms.ToTensor(),
-        (BGR2RGB_transform() if INPUT_SPACE == 'RGB' else None),
+        BGR2RGB_transform() if INPUT_SPACE == 'RGB' else lambda x: x,  # Fix for 'NoneType' error
         transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
     ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size * len(gpus),
-                                   num_workers=16, shuffle=True, pin_memory=True, drop_last=True)
+                                   num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
     print(f'Total training samples: {len(train_dataset)}')
 
     # Optimizer and Scheduler
