@@ -2,6 +2,7 @@ import os
 import json
 import timeit
 import argparse
+from tqdm import tqdm
 
 import torch
 import torch.optim as optim
@@ -133,7 +134,8 @@ def main():
         lr = lr_scheduler.get_lr()[0]
         model.train()
 
-        for i_iter, batch in enumerate(train_loader):
+        # Wrap the train_loader with tqdm for progress bar
+        for i_iter, batch in enumerate(tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}', total=len(train_loader))):
             i_iter += len(train_loader) * epoch
             images, labels, _ = batch
             images = images.cuda(non_blocking=True).float()
