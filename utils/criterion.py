@@ -44,18 +44,21 @@ class CriterionAll(nn.Module):
         Args:
             preds: [[parsing result1, parsing result2], [edge result]]
             target: [parsing label, edge label]
-            soft_preds: [[parsing result1, parsing result2], [edge result]]
+            cycle_n: optional parameter for cycle consistency (used in regularization)
+            
         Returns:
             Calculated Loss.
         """
         h, w = target[0].size(1), target[0].size(2)
     
+        # Calculate the number of positive and negative samples
         pos_num = torch.sum(target[1] == 1, dtype=torch.float)
         neg_num = torch.sum(target[1] == 0, dtype=torch.float)
     
+        # Calculate weights based on the class distribution
         weight_pos = neg_num / (pos_num + neg_num)
         weight_neg = pos_num / (pos_num + neg_num)
-        weights = torch.tensor([weight_neg, weight_pos])  # edge loss weight
+        weights = torch.tensor([weight_neg, weight_pos], device=target[1].device)  # Move weights to target device
     
         print(f"pos_num: {pos_num}, neg_num: {neg_num}")
         print(f"weight_pos: {weight_pos}, weight_neg: {weight_neg}")
@@ -63,58 +66,54 @@ class CriterionAll(nn.Module):
     
         loss = 0
     
-        # loss for segmentation
+        # Helper function for scaling and interpolating predictions
+        def scale_and_interpolate(pred, h, w):
+            return F.interpolate(input=pred, size=(h, w), mode='bilinear', align_corners=True)
+    
+        # Loss for parsing (segmentation)
         preds_parsing = preds[0]
         for pred_parsing in preds_parsing:
             print(f"Pred Parsing Shape: {pred_parsing.shape}")
-            scale_pred = F.interpolate(input=pred_parsing, size=(h, w),
-                                       mode='bilinear', align_corners=True)
+            scale_pred = scale_and_interpolate(pred_parsing, h, w)
             print(f"Scaled Pred Parsing Shape: {scale_pred.shape}")
     
+            # Parsing loss calculation
             loss += 0.5 * self.lamda_1 * self.lovasz(scale_pred, target[0])
             if target[2] is None:
                 loss += 0.5 * self.lamda_1 * self.criterion(scale_pred, target[0])
             else:
-                soft_scale_pred = F.interpolate(input=target[2], size=(h, w),
-                                                mode='bilinear', align_corners=True)
+                soft_scale_pred = scale_and_interpolate(target[2], h, w)
                 print(f"Soft Scaled Pred Parsing Shape: {soft_scale_pred.shape}")
                 soft_scale_pred = moving_average(soft_scale_pred, to_one_hot(target[0], num_cls=self.num_classes),
                                                  1.0 / (cycle_n + 1.0))
                 loss += 0.5 * self.lamda_1 * self.kldiv(scale_pred, soft_scale_pred, target[0])
     
-        # loss for edge
+        # Loss for edge detection
         preds_edge = preds[1]
         for pred_edge in preds_edge:
             print(f"Pred Edge Shape: {pred_edge.shape}")
-            scale_pred = F.interpolate(input=pred_edge, size=(h, w),
-                                       mode='bilinear', align_corners=True)
+            scale_pred = scale_and_interpolate(pred_edge, h, w)
             print(f"Scaled Pred Edge Shape: {scale_pred.shape}")
     
-            # Ensure weights are in the same dtype as scale_pred
-            weights = weights.to(scale_pred.dtype)  # Cast weights to match scale_pred dtype
+            # Ensure weights are in the correct dtype
+            weights = weights.to(scale_pred.dtype)
             print(f"weights dtype: {weights.dtype}, scale_pred dtype: {scale_pred.dtype}")
     
             if target[3] is None:
                 print(f"Target[1] dtype: {target[1].dtype}")
-                loss += self.lamda_2 * F.cross_entropy(scale_pred, target[1],
-                                                       weights.cuda(), ignore_index=self.ignore_index)
+                loss += self.lamda_2 * F.cross_entropy(scale_pred, target[1], weights.cuda(), ignore_index=self.ignore_index)
             else:
-                soft_scale_edge = F.interpolate(input=target[3], size=(h, w),
-                                                mode='bilinear', align_corners=True)
+                soft_scale_edge = scale_and_interpolate(target[3], h, w)
                 print(f"Soft Scaled Pred Edge Shape: {soft_scale_edge.shape}")
                 soft_scale_edge = moving_average(soft_scale_edge, to_one_hot(target[1], num_cls=2),
                                                  1.0 / (cycle_n + 1.0))
                 loss += self.lamda_2 * self.kldiv(scale_pred, soft_scale_edge, target[0])
     
-        # consistency regularization
-        preds_parsing = preds[0]
-        preds_edge = preds[1]
+        # Consistency regularization between parsing and edge predictions
         for pred_parsing in preds_parsing:
             print(f"Pred Parsing Shape (Consistency): {pred_parsing.shape}")
-            scale_pred = F.interpolate(input=pred_parsing, size=(h, w),
-                                       mode='bilinear', align_corners=True)
-            scale_edge = F.interpolate(input=preds_edge[0], size=(h, w),
-                                       mode='bilinear', align_corners=True)
+            scale_pred = scale_and_interpolate(pred_parsing, h, w)
+            scale_edge = scale_and_interpolate(preds_edge[0], h, w)
             print(f"Scaled Pred Parsing Shape (Consistency): {scale_pred.shape}")
             print(f"Scaled Pred Edge Shape (Consistency): {scale_edge.shape}")
     
