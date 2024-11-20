@@ -68,7 +68,7 @@ class LIPDataSet(data.Dataset):
             if im is None:
                 raise IOError(f"Image file {im_path} is unreadable or corrupted.")
             h, w, _ = im.shape
-            parsing_anno = np.zeros((h, w), dtype=np.long)
+            parsing_anno = np.zeros((h, w), dtype=np.int64)
 
             # Get person center and scale
             person_center, s = self._box2cs([0, 0, w - 1, h - 1])
