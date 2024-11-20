@@ -1,17 +1,3 @@
-#!/usr/bin/env python
-# -*- encoding: utf-8 -*-
-
-
-"""
-@Author  :   Peike Li
-@Contact :   peike.li@yahoo.com
-@File    :   train.py
-@Time    :   8/4/19 3:36 PM
-@Desc    :
-@License :   This source code is licensed under the license found in the
-             LICENSE file in the root directory of this source tree.
-"""
-
 import os
 import json
 import timeit
@@ -19,9 +5,9 @@ import argparse
 
 import torch
 import torch.optim as optim
-import torchvision.transforms as transforms
 import torch.backends.cudnn as cudnn
 from torch.utils import data
+import torchvision.transforms as transforms
 
 import networks
 import utils.schp as schp
@@ -34,10 +20,6 @@ from utils.warmup_scheduler import SGDRScheduler
 
 
 def get_arguments():
-    """Parse all the arguments provided from the CLI.
-    Returns:
-      A list of parsed arguments.
-    """
     parser = argparse.ArgumentParser(description="Self Correction for Human Parsing")
 
     # Network Structure
@@ -54,7 +36,7 @@ def get_arguments():
     parser.add_argument("--learning-rate", type=float, default=7e-3)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--gpu", type=str, default='0')  # Now a single GPU
+    parser.add_argument("--gpu", type=str, default='0')
     parser.add_argument("--start-epoch", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--eval-epochs", type=int, default=10)
@@ -67,6 +49,7 @@ def get_arguments():
     parser.add_argument("--lambda-s", type=float, default=1, help='segmentation loss weight')
     parser.add_argument("--lambda-e", type=float, default=1, help='edge loss weight')
     parser.add_argument("--lambda-c", type=float, default=0.1, help='segmentation-edge consistency loss weight')
+
     return parser.parse_args()
 
 
@@ -82,9 +65,8 @@ def main():
     with open(os.path.join(args.log_dir, 'args.json'), 'w') as opt_file:
         json.dump(vars(args), opt_file)
 
-    gpus = [int(i) for i in args.gpu.split(',')]
-    if not args.gpu == 'None':
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # Use only one GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     input_size = list(map(int, args.input_size.split(',')))
 
@@ -131,7 +113,6 @@ def main():
         print('BGR Transformation')
         transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=IMAGE_MEAN,
                                                                                    std=IMAGE_STD), ])
-
     elif INPUT_SPACE == 'RGB':
         print('RGB Transformation')
         transform = transforms.Compose([transforms.ToTensor(),
@@ -154,6 +135,7 @@ def main():
 
     total_iters = args.epochs * len(train_loader)
     start = timeit.default_timer()
+
     for epoch in range(start_epoch, args.epochs):
         lr_scheduler.step(epoch=epoch)
         lr = lr_scheduler.get_lr()[0]
@@ -187,24 +169,41 @@ def main():
                 soft_preds = None
                 soft_edges = None
 
+            # Calculate loss with correct inputs
             loss = criterion(preds, [labels, edges, soft_preds, soft_edges], cycle_n)
 
             optimizer.zero_grad()
             loss.backward()
 
-            # Free GPU memory after every iteration
+            # Use torch's built-in memory management to avoid OOM
             torch.cuda.empty_cache()
 
             optimizer.step()
 
             if i_iter % 100 == 0:
-                print('iter = {} of {} completed, lr = {}, loss = {}'.format(i_iter, total_iters, lr,
-                                                                             loss.data.cpu().numpy()))
-        if (epoch + 1) % (args.eval_epochs) == 0:
-            print('Evaluating the model...')
-            # Add your evaluation function here
+                print(f"iter = {i_iter} of {total_iters} completed, lr = {lr}, loss = {loss.item()}")
 
-    print(f'Training completed in {timeit.default_timer() - start} seconds.')
+        if (epoch + 1) % args.eval_epochs == 0:
+            schp.save_schp_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+            }, False, args.log_dir, filename=f'checkpoint_{epoch + 1}.pth.tar')
 
-if __name__ == '__main__':
+        # Self Correction Cycle with Model Aggregation
+        if (epoch + 1) >= args.schp_start and (epoch + 1 - args.schp_start) % args.cycle_epochs == 0:
+            print(f'Self-correction cycle number {cycle_n}')
+            schp.moving_average(schp_model, model, 1.0 / (cycle_n + 1))
+            cycle_n += 1
+            schp.bn_re_estimate(train_loader, schp_model)
+            schp.save_schp_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': schp_model.state_dict(),
+                'cycle_n': cycle_n,
+            }, False, args.log_dir, filename=f'schp_checkpoint_{cycle_n}.pth.tar')
+
+    stop = timeit.default_timer()
+    print("Training time: ", stop - start)
+
+
+if __name__ == "__main__":
     main()
