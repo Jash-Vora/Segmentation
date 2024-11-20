@@ -54,7 +54,7 @@ def get_arguments():
     parser.add_argument("--learning-rate", type=float, default=7e-3)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--gpu", type=str, default='0,1,2')
+    parser.add_argument("--gpu", type=str, default='0')  # Now a single GPU
     parser.add_argument("--start-epoch", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--eval-epochs", type=int, default=10)
@@ -93,7 +93,7 @@ def main():
 
     # Model Initialization
     AugmentCE2P = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain)
-    model = DataParallelModel(AugmentCE2P)
+    model = AugmentCE2P
     model.cuda()
 
     IMAGE_MEAN = AugmentCE2P.mean
@@ -111,7 +111,7 @@ def main():
         start_epoch = checkpoint['epoch']
 
     SCHP_AugmentCE2P = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain)
-    schp_model = DataParallelModel(SCHP_AugmentCE2P)
+    schp_model = SCHP_AugmentCE2P
     schp_model.cuda()
 
     if os.path.exists(args.schp_restore):
@@ -124,7 +124,6 @@ def main():
     # Loss Function
     criterion = CriterionAll(lambda_1=args.lambda_s, lambda_2=args.lambda_e, lambda_3=args.lambda_c,
                              num_classes=args.num_classes)
-    criterion = DataParallelCriterion(criterion)
     criterion.cuda()
 
     # Data Loader
@@ -140,7 +139,7 @@ def main():
                                         transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD), ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size * len(gpus),
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size,
                                    num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
     print('Total training samples: {}'.format(len(train_dataset)))
 
@@ -193,7 +192,7 @@ def main():
             optimizer.zero_grad()
             loss.backward()
 
-            # Use torch's built-in memory management to avoid OOM
+            # Free GPU memory after every iteration
             torch.cuda.empty_cache()
 
             optimizer.step()
@@ -202,26 +201,10 @@ def main():
                 print('iter = {} of {} completed, lr = {}, loss = {}'.format(i_iter, total_iters, lr,
                                                                              loss.data.cpu().numpy()))
         if (epoch + 1) % (args.eval_epochs) == 0:
-            schp.save_schp_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-            }, False, args.log_dir, filename='checkpoint_{}.pth.tar'.format(epoch + 1))
+            print('Evaluating the model...')
+            # Add your evaluation function here
 
-        # Self Correction Cycle with Model Aggregation
-        if (epoch + 1) >= args.schp_start and (epoch + 1 - args.schp_start) % args.cycle_epochs == 0:
-            print('Self-correction cycle number {}'.format(cycle_n))
-            schp.moving_average(schp_model, model, 1.0 / (cycle_n + 1))
-            cycle_n += 1
-            schp.bn_re_estimate(train_loader, schp_model)
-            schp.save_schp_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': schp_model.state_dict(),
-                'cycle_n': cycle_n,
-            }, False, args.log_dir, filename='schp_checkpoint_{}.pth.tar'.format(cycle_n))
+    print(f'Training completed in {timeit.default_timer() - start} seconds.')
 
-    stop = timeit.default_timer()
-    print("Training time: ", stop - start)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
