@@ -1,8 +1,20 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+
+"""
+@Author  :   Peike Li
+@Contact :   peike.li@yahoo.com
+@File    :   train.py
+@Time    :   8/4/19 3:36 PM
+@Desc    :
+@License :   This source code is licensed under the license found in the
+             LICENSE file in the root directory of this source tree.
+"""
+
 import os
 import json
 import timeit
 import argparse
-from tqdm import tqdm
 
 import torch
 import torch.optim as optim
@@ -21,9 +33,15 @@ from utils.warmup_scheduler import SGDRScheduler
 
 
 def get_arguments():
-    """Parse all the arguments provided from the CLI."""
+    """Parse all the arguments provided from the CLI.
+    Returns:
+      A list of parsed arguments.
+    """
     parser = argparse.ArgumentParser(description="Self Correction for Human Parsing")
+
+    # Network Structure
     parser.add_argument("--arch", type=str, default='resnet101')
+    # Data Preference
     parser.add_argument("--data-dir", type=str, default='./data/LIP')
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--input-size", type=str, default='473,473')
@@ -31,22 +49,23 @@ def get_arguments():
     parser.add_argument("--ignore-label", type=int, default=255)
     parser.add_argument("--random-mirror", action="store_true")
     parser.add_argument("--random-scale", action="store_true")
+    # Training Strategy
     parser.add_argument("--learning-rate", type=float, default=7e-3)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--gpu", type=str, default='0')
+    parser.add_argument("--gpu", type=str, default='0,1,2')
     parser.add_argument("--start-epoch", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--eval-epochs", type=int, default=10)
     parser.add_argument("--imagenet-pretrain", type=str, default='./pretrain_model/resnet101-imagenet.pth')
     parser.add_argument("--log-dir", type=str, default='./log')
     parser.add_argument("--model-restore", type=str, default='./log/checkpoint.pth.tar')
-    parser.add_argument("--schp-start", type=int, default=100)
-    parser.add_argument("--cycle-epochs", type=int, default=10)
+    parser.add_argument("--schp-start", type=int, default=100, help='schp start epoch')
+    parser.add_argument("--cycle-epochs", type=int, default=10, help='schp cyclical epoch')
     parser.add_argument("--schp-restore", type=str, default='./log/schp_checkpoint.pth.tar')
-    parser.add_argument("--lambda-s", type=float, default=1)
-    parser.add_argument("--lambda-e", type=float, default=1)
-    parser.add_argument("--lambda-c", type=float, default=0.1)
+    parser.add_argument("--lambda-s", type=float, default=1, help='segmentation loss weight')
+    parser.add_argument("--lambda-e", type=float, default=1, help='edge loss weight')
+    parser.add_argument("--lambda-c", type=float, default=0.1, help='segmentation-edge consistency loss weight')
     return parser.parse_args()
 
 
@@ -63,7 +82,8 @@ def main():
         json.dump(vars(args), opt_file)
 
     gpus = [int(i) for i in args.gpu.split(',')]
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    if not args.gpu == 'None':
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     input_size = list(map(int, args.input_size.split(',')))
 
@@ -78,13 +98,13 @@ def main():
     IMAGE_MEAN = AugmentCE2P.mean
     IMAGE_STD = AugmentCE2P.std
     INPUT_SPACE = AugmentCE2P.input_space
-    print(f'image mean: {IMAGE_MEAN}')
-    print(f'image std: {IMAGE_STD}')
-    print(f'input space: {INPUT_SPACE}')
+    print('image mean: {}'.format(IMAGE_MEAN))
+    print('image std: {}'.format(IMAGE_STD))
+    print('input space:{}'.format(INPUT_SPACE))
 
     restore_from = args.model_restore
     if os.path.exists(restore_from):
-        print(f'Resume training from {restore_from}')
+        print('Resume training from {}'.format(restore_from))
         checkpoint = torch.load(restore_from)
         model.load_state_dict(checkpoint['state_dict'])
         start_epoch = checkpoint['epoch']
@@ -94,29 +114,42 @@ def main():
     schp_model.cuda()
 
     if os.path.exists(args.schp_restore):
-        print(f'Resuming schp checkpoint from {args.schp_restore}')
+        print('Resuming schp checkpoint from {}'.format(args.schp_restore))
         schp_checkpoint = torch.load(args.schp_restore)
-        schp_model.load_state_dict(schp_checkpoint['state_dict'])
+        schp_model_state_dict = schp_checkpoint['state_dict']
         cycle_n = schp_checkpoint['cycle_n']
+        schp_model.load_state_dict(schp_model_state_dict)
 
+    # Loss Function
     criterion = CriterionAll(lambda_1=args.lambda_s, lambda_2=args.lambda_e, lambda_3=args.lambda_c,
                              num_classes=args.num_classes)
     criterion = DataParallelCriterion(criterion)
     criterion.cuda()
 
     # Data Loader
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        BGR2RGB_transform() if INPUT_SPACE == 'RGB' else lambda x: x,  # Fix for 'NoneType' error
-        transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
-    ])
+    if INPUT_SPACE == 'BGR':
+        print('BGR Transformation')
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGE_MEAN,
+                                 std=IMAGE_STD),
+        ])
+
+    elif INPUT_SPACE == 'RGB':
+        print('RGB Transformation')
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            BGR2RGB_transform(),
+            transforms.Normalize(mean=IMAGE_MEAN,
+                                 std=IMAGE_STD),
+        ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size * len(gpus),
-                                   num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
-    print(f'Total training samples: {len(train_dataset)}')
+                                   num_workers=16, shuffle=True, pin_memory=True, drop_last=True)
+    print('Total training samples: {}'.format(len(train_dataset)))
 
-    # Optimizer and Scheduler
+    # Optimizer Initialization
     optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum,
                           weight_decay=args.weight_decay)
 
@@ -125,68 +158,73 @@ def main():
                                  start_cyclical=args.schp_start, cyclical_base_lr=args.learning_rate / 2,
                                  cyclical_epoch=args.cycle_epochs)
 
-    scaler = torch.cuda.amp.GradScaler()
     total_iters = args.epochs * len(train_loader)
-
     start = timeit.default_timer()
     for epoch in range(start_epoch, args.epochs):
         lr_scheduler.step(epoch=epoch)
         lr = lr_scheduler.get_lr()[0]
+
         model.train()
-
-        # Wrap the train_loader with tqdm for progress bar
-        for i_iter, batch in enumerate(tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}', total=len(train_loader))):
+        for i_iter, batch in enumerate(train_loader):
             i_iter += len(train_loader) * epoch
+
             images, labels, _ = batch
-            images = images.cuda(non_blocking=True).float()
-            labels = labels.cuda(non_blocking=True).long()
+            labels = labels.cuda(non_blocking=True)
+
             edges = generate_edge_tensor(labels)
+            labels = labels.type(torch.cuda.LongTensor)
+            edges = edges.type(torch.cuda.LongTensor)
 
-            with torch.cuda.amp.autocast():
-                preds = model(images)
+            preds = model(images)
 
-                if cycle_n >= 1:
-                    with torch.no_grad():
-                        soft_preds = schp_model(images)
-                        soft_parsing = torch.cat([sp[0][-1] for sp in soft_preds], dim=0)
-                        soft_edges = torch.cat([sp[1][-1] for sp in soft_preds], dim=0)
-                else:
-                    soft_parsing, soft_edges = None, None
+            # Online Self Correction Cycle with Label Refinement
+            if cycle_n >= 1:
+                with torch.no_grad():
+                    soft_preds = schp_model(images)
+                    soft_parsing = []
+                    soft_edge = []
+                    for soft_pred in soft_preds:
+                        soft_parsing.append(soft_pred[0][-1])
+                        soft_edge.append(soft_pred[1][-1])
+                    soft_preds = torch.cat(soft_parsing, dim=0)
+                    soft_edges = torch.cat(soft_edge, dim=0)
+            else:
+                soft_preds = None
+                soft_edges = None
 
-                loss = criterion(preds, [labels, edges, soft_parsing, soft_edges], cycle_n)
+            loss = criterion(preds, [labels, edges, soft_preds, soft_edges], cycle_n)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
             if i_iter % 100 == 0:
-                print(f'iter = {i_iter}/{total_iters}, lr = {lr:.6f}, loss = {loss.item():.6f}')
-
-            torch.cuda.empty_cache()
-
-        if (epoch + 1) % args.eval_epochs == 0:
+                print('iter = {} of {} completed, lr = {}, loss = {}'.format(i_iter, total_iters, lr,
+                                                                             loss.data.cpu().numpy()))
+        if (epoch + 1) % (args.eval_epochs) == 0:
             schp.save_schp_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
-            }, False, args.log_dir, filename=f'checkpoint_{epoch + 1}.pth.tar')
+            }, False, args.log_dir, filename='checkpoint_{}.pth.tar'.format(epoch + 1))
 
+        # Self Correction Cycle with Model Aggregation
         if (epoch + 1) >= args.schp_start and (epoch + 1 - args.schp_start) % args.cycle_epochs == 0:
-            print(f'Self-correction cycle number {cycle_n}')
+            print('Self-correction cycle number {}'.format(cycle_n))
             schp.moving_average(schp_model, model, 1.0 / (cycle_n + 1))
             cycle_n += 1
             schp.bn_re_estimate(train_loader, schp_model)
             schp.save_schp_checkpoint({
                 'state_dict': schp_model.state_dict(),
                 'cycle_n': cycle_n,
-            }, False, args.log_dir, filename=f'schp_{cycle_n}_checkpoint.pth.tar')
+            }, False, args.log_dir, filename='schp_{}_checkpoint.pth.tar'.format(cycle_n))
 
         torch.cuda.empty_cache()
         end = timeit.default_timer()
-        print(f'epoch = {epoch}/{args.epochs} completed using {(end - start) / (epoch - start_epoch + 1):.2f} s')
+        print('epoch = {} of {} completed using {} s'.format(epoch, args.epochs,
+                                                             (end - start) / (epoch - start_epoch + 1)))
 
     end = timeit.default_timer()
-    print(f'Training Finished in {end - start:.2f} seconds')
+    print('Training Finished in {} seconds'.format(end - start))
 
 
 if __name__ == '__main__':
