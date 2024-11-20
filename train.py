@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
+
 """
 @Author  :   Peike Li
 @Contact :   peike.li@yahoo.com
@@ -129,24 +130,18 @@ def main():
     # Data Loader
     if INPUT_SPACE == 'BGR':
         print('BGR Transformation')
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=IMAGE_MEAN,
-                                 std=IMAGE_STD),
-        ])
+        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=IMAGE_MEAN,
+                                                                                   std=IMAGE_STD), ])
 
     elif INPUT_SPACE == 'RGB':
         print('RGB Transformation')
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            BGR2RGB_transform(),
-            transforms.Normalize(mean=IMAGE_MEAN,
-                                 std=IMAGE_STD),
-        ])
+        transform = transforms.Compose([transforms.ToTensor(),
+                                        BGR2RGB_transform(),
+                                        transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD), ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size * len(gpus),
-                                   num_workers=16, shuffle=True, pin_memory=True, drop_last=True)
+                                   num_workers=4, shuffle=True, pin_memory=True, drop_last=True)
     print('Total training samples: {}'.format(len(train_dataset)))
 
     # Optimizer Initialization
@@ -197,6 +192,10 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
+
+            # Use torch's built-in memory management to avoid OOM
+            torch.cuda.empty_cache()
+
             optimizer.step()
 
             if i_iter % 100 == 0:
@@ -215,18 +214,14 @@ def main():
             cycle_n += 1
             schp.bn_re_estimate(train_loader, schp_model)
             schp.save_schp_checkpoint({
+                'epoch': epoch + 1,
                 'state_dict': schp_model.state_dict(),
                 'cycle_n': cycle_n,
-            }, False, args.log_dir, filename='schp_{}_checkpoint.pth.tar'.format(cycle_n))
+            }, False, args.log_dir, filename='schp_checkpoint_{}.pth.tar'.format(cycle_n))
 
-        torch.cuda.empty_cache()
-        end = timeit.default_timer()
-        print('epoch = {} of {} completed using {} s'.format(epoch, args.epochs,
-                                                             (end - start) / (epoch - start_epoch + 1)))
-
-    end = timeit.default_timer()
-    print('Training Finished in {} seconds'.format(end - start))
+    stop = timeit.default_timer()
+    print("Training time: ", stop - start)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
